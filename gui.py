@@ -294,18 +294,68 @@ class EmbeddedServer:
                 continue
             except OSError:
                 break
-            with self.clients_lock:
-                ci = self.clients.get(src)
+            matched_addr, ci, msg_type, seq_num = self._match_udp_sender(src, data)
             if ci is None:
                 continue
-            try:
-                msg_type, seq_num, _ = parse_udp_packet(data, ci.session_key)
-            except Exception:
-                continue
+            if matched_addr != src:
+                self._remap_client_udp_addr(matched_addr, src, ci)
             if msg_type == MSG_ACK:
                 self._handle_ack(src, seq_num, ci)
             elif msg_type == MSG_HEARTBEAT_ACK:
                 ci.last_heartbeat = time.time()
+
+    def _match_udp_sender(self, src, data):
+        with self.clients_lock:
+            direct = self.clients.get(src)
+        if direct is not None:
+            try:
+                msg_type, seq_num, _ = parse_udp_packet(data, direct.session_key)
+                return src, direct, msg_type, seq_num
+            except Exception:
+                pass
+
+        with self.clients_lock:
+            snap = list(self.clients.items())
+        same_ip = [(addr, ci) for addr, ci in snap if addr[0] == src[0]]
+        rest = [(addr, ci) for addr, ci in snap if addr[0] != src[0]]
+
+        for reg_addr, ci in same_ip + rest:
+            try:
+                msg_type, seq_num, _ = parse_udp_packet(data, ci.session_key)
+                return reg_addr, ci, msg_type, seq_num
+            except Exception:
+                continue
+        return None, None, None, None
+
+    def _remap_client_udp_addr(self, old_addr, new_addr, ci):
+        if old_addr == new_addr:
+            return
+
+        with self.clients_lock:
+            current = self.clients.get(old_addr)
+            if current is None:
+                return
+            self.clients.pop(old_addr, None)
+            current.udp_addr = new_addr
+            self.clients[new_addr] = current
+
+        with self.pending_lock:
+            for pm in self.pending_acks.values():
+                if old_addr in pm.encrypted_data:
+                    pm.encrypted_data[new_addr] = pm.encrypted_data.pop(old_addr)
+                if old_addr in pm.retries:
+                    pm.retries[new_addr] = pm.retries.pop(old_addr)
+                if old_addr in pm.last_sent:
+                    pm.last_sent[new_addr] = pm.last_sent.pop(old_addr)
+                if old_addr in pm.pending_clients:
+                    pm.pending_clients.discard(old_addr)
+                    pm.pending_clients.add(new_addr)
+
+        self._log(
+            "INFO",
+            f"UDP endpoint updated for '{ci.name}': {old_addr[0]}:{old_addr[1]} → {new_addr[0]}:{new_addr[1]}",
+        )
+        self._push_clients()
 
     def _handle_ack(self, udp_addr, seq_num, ci):
         self.stat_acks_received += 1
@@ -487,7 +537,20 @@ class EmbeddedClient:
         self.server_udp_port = int(resp["server_udp_port"])
         self._log("INFO", f"Subscribed – session key {len(self.session_key)} bytes, "
                           f"server UDP port {self.server_udp_port}")
+        self._send_udp_bootstrap()
         return self
+
+    def _send_udp_bootstrap(self):
+        """Send one UDP packet immediately so server can learn the real endpoint."""
+        if not self.session_key or self.server_udp_port is None:
+            return
+        try:
+            server_ip = self.tcp_conn.getpeername()[0]
+            pkt = build_udp_packet(MSG_HEARTBEAT_ACK, 0, self.session_key, b"")
+            self.udp_sock.sendto(pkt, (server_ip, self.server_udp_port))
+            self._log("INFO", f"UDP bootstrap sent to {server_ip}:{self.server_udp_port}")
+        except OSError as exc:
+            self._log("WARN", f"UDP bootstrap failed: {exc}")
 
     def start_listening(self):
         self.running = True
